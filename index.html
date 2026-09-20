@@ -513,6 +513,7 @@ function safeParse(s, d) { if (!s) return d; try { return JSON.parse(s); } catch
 function padZero(n) { return n < 10 ? '0' + n : '' + n; }
 function $(id) { return document.getElementById(id); }
 
+/* ★ 改动：不再“总量超 3MB 就全清”，只清掉最占空间的表情包存档 */
 try {
     var totalSize = 0;
     for (var i = 0; i < localStorage.length; i++) {
@@ -520,7 +521,9 @@ try {
         var v = localStorage.getItem(k);
         if (v) totalSize += v.length;
     }
-    if (totalSize > 3000000) { localStorage.clear(); }
+    if (totalSize > 3000000) {
+        try { localStorage.removeItem('dreamStickersV1'); } catch (e) {}
+    }
 } catch (e) {}
 
 var defaultSettings = {
@@ -605,6 +608,53 @@ if (!stickerData.sticker.user) stickerData.sticker.user = [];
 function saveData() { safeSet('dreamCardsV2', JSON.stringify(libraryData)); }
 function saveStickerData() { safeSet('dreamStickersV1', JSON.stringify(stickerData)); }
 
+/* ============================================================
+   ★ 新增：聊天记录持久化
+   ============================================================ */
+var CHAT_HISTORY_KEY = 'dreamChatHistory';
+var CHAT_HISTORY_MAX = 200;          // 最多保留 200 条记录，防止撑爆 localStorage
+var chatHistory = safeParse(safeGet(CHAT_HISTORY_KEY), []) || [];
+if (!Array.isArray(chatHistory)) chatHistory = [];
+var isRestoringChat = false;         // 恢复过程中禁止写入
+
+// 加载时先修剪一次超量记录
+if (chatHistory.length > CHAT_HISTORY_MAX) {
+    chatHistory = chatHistory.slice(-CHAT_HISTORY_MAX);
+}
+
+function pushChatHistory(rec) {
+    if (isRestoringChat) return null;
+    chatHistory.push(rec);
+    saveChatHistory();
+    return rec;
+}
+
+function saveChatHistory() {
+    if (isRestoringChat) return;
+    while (chatHistory.length > CHAT_HISTORY_MAX) chatHistory.shift();
+    // 配额不足时，从最旧的一半开始丢弃，直到能存下
+    while (true) {
+        try {
+            localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(chatHistory));
+            return;
+        } catch (err) {
+            if (chatHistory.length === 0) {
+                try { localStorage.removeItem(CHAT_HISTORY_KEY); } catch (e) {}
+                return;
+            }
+            chatHistory.splice(0, Math.max(1, Math.floor(chatHistory.length / 2)));
+        }
+    }
+}
+
+function getCurrentDateStr() {
+    var now = new Date();
+    var bj = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + 8 * 3600000);
+    return bj.getFullYear() + '年' + (bj.getMonth() + 1) + '月' + bj.getDate() + '日';
+}
+
+/* ============================================================ */
+
 var userMessageHistory = [];
 var currentGroupFilter = '全部', currentSearchQuery = '';
 var selectedCardIds = {}, selectedCardCount = 0;
@@ -641,14 +691,13 @@ function showAlert(title, msg, onClose) {
 
 function scrollToBottom() { var c = $('chatContainer'); if (c) c.scrollTop = c.scrollHeight; }
 
-function checkDateDivider() {
-    var now = new Date();
-    var bj = new Date(now.getTime() + (now.getTimezoneOffset() * 60000) + 8 * 3600000);
-    var todayStr = bj.getFullYear() + '年' + (bj.getMonth() + 1) + '月' + bj.getDate() + '日';
-    if (lastMessageDateStr !== todayStr) {
-        var div = document.createElement('div'); div.className = 'date-divider'; div.innerHTML = '<span>' + todayStr + '</span>';
+/* ★ 改动：支持传入指定日期（用于恢复历史记录时还原日期分割线） */
+function checkDateDivider(forceDateStr) {
+    var dateStr = forceDateStr || getCurrentDateStr();
+    if (lastMessageDateStr !== dateStr) {
+        var div = document.createElement('div'); div.className = 'date-divider'; div.innerHTML = '<span>' + dateStr + '</span>';
         var c = $('chatContainer'); if (c) c.appendChild(div);
-        lastMessageDateStr = todayStr;
+        lastMessageDateStr = dateStr;
     }
 }
 
@@ -665,9 +714,10 @@ function createAvatar(type) {
     return div;
 }
 
-function appendMessage(content, type, quote) {
+/* ★ 改动：新增 dateStr 参数 + 写入聊天记录存档 */
+function appendMessage(content, type, quote, dateStr) {
     var c = $('chatContainer'); if (!c) return;
-    checkDateDivider();
+    checkDateDivider(dateStr);
     var isUser = (type === 'user');
     var sameAsLast = (lastSender === type);
     var row = document.createElement('div');
@@ -691,8 +741,10 @@ function appendMessage(content, type, quote) {
     c.appendChild(row);
     lastSender = type;
     scrollToBottom();
+    pushChatHistory({ k: 'msg', c: content, t: type, q: quote || null, d: dateStr || getCurrentDateStr() });
 }
 
+/* ★ 改动：写入聊天记录存档 */
 function appendTimeCost(seconds) {
     var wraps = document.querySelectorAll('.message-bubble-wrap.received');
     if (wraps.length === 0) return;
@@ -700,11 +752,13 @@ function appendTimeCost(seconds) {
     var tc = document.createElement('div'); tc.className = 'time-cost'; tc.textContent = '对方用时 ' + seconds + 's';
     lastWrap.appendChild(tc);
     scrollToBottom();
+    pushChatHistory({ k: 'time', s: seconds });
 }
 
-function appendReadNoReply() {
+/* ★ 改动：新增 dateStr 参数 + 写入聊天记录存档 */
+function appendReadNoReply(dateStr) {
     var c = $('chatContainer'); if (!c) return;
-    checkDateDivider();
+    checkDateDivider(dateStr);
     var row = document.createElement('div'); row.className = 'message-row received first-in-group';
     var avatar = createAvatar('received');
     if (avatar) row.appendChild(avatar);
@@ -713,6 +767,7 @@ function appendReadNoReply() {
     wrap.appendChild(el); row.appendChild(wrap); c.appendChild(row);
     lastSender = 'received';
     scrollToBottom();
+    pushChatHistory({ k: 'read', d: dateStr || getCurrentDateStr() });
 }
 
 function openImagePreview(src) { var p = $('imagePreviewModal'); if (p) { $('previewImage').src = src; p.style.display = 'flex'; } }
@@ -991,18 +1046,54 @@ function renderOptionsEditor() {
     }
 }
 
-function appendChoiceCard(q, options) {
-    checkDateDivider();
+/* ★ 改动：支持恢复已选选项 + 传入已有记录 + 日期，并写入存档 */
+function appendChoiceCard(q, options, pickedIdx, existRec, dateStr) {
+    checkDateDivider(dateStr || (existRec && existRec.d) || null);
     var card = document.createElement('div'); card.className = 'choice-card';
     var h = document.createElement('div'); h.className = 'choice-card-header'; h.textContent = '抉择';
     var qe = document.createElement('div'); qe.className = 'choice-card-question'; qe.textContent = q;
     var ow = document.createElement('div'); ow.className = 'choice-card-options';
-    for (var i = 0; i < options.length; i++) { var oe = document.createElement('div'); oe.className = 'choice-card-option'; oe.textContent = options[i]; ow.appendChild(oe); }
+    for (var i = 0; i < options.length; i++) {
+        var oe = document.createElement('div');
+        oe.className = 'choice-card-option';
+        if (typeof pickedIdx === 'number' && pickedIdx === i) oe.className += ' picked';
+        oe.textContent = options[i];
+        ow.appendChild(oe);
+    }
     card.appendChild(h); card.appendChild(qe); card.appendChild(ow);
     var c = $('chatContainer'); if (c) c.appendChild(card);
     lastSender = 'user';
     scrollToBottom();
+    var rec = existRec || pushChatHistory({
+        k: 'choice',
+        q: q,
+        opts: options.slice(),
+        picked: (typeof pickedIdx === 'number' ? pickedIdx : -1),
+        d: dateStr || getCurrentDateStr()
+    });
+    card._histRec = rec;
     return card;
+}
+
+/* ============================================================
+   ★ 新增：从存档恢复聊天记录
+   ============================================================ */
+function restoreChatHistory() {
+    if (!chatHistory || !chatHistory.length) return;
+    isRestoringChat = true;
+    var c = $('chatContainer');
+    if (c) c.innerHTML = '';
+    lastSender = '';
+    lastMessageDateStr = '';
+    for (var i = 0; i < chatHistory.length; i++) {
+        var m = chatHistory[i];
+        if (!m || !m.k) continue;
+        if (m.k === 'read') { appendReadNoReply(m.d); continue; }
+        if (m.k === 'choice') { appendChoiceCard(m.q, m.opts || [], (typeof m.picked === 'number' ? m.picked : -1), m, m.d); continue; }
+        if (m.k === 'time') { appendTimeCost(m.s); continue; }
+        if (m.k === 'msg') { appendMessage(m.c, m.t, m.q, m.d); continue; }
+    }
+    isRestoringChat = false;
 }
 
 /* ============ 全屏功能 ============ */
@@ -1058,6 +1149,7 @@ function init() {
     updateBeijingTime();
     setInterval(updateBeijingTime, 1000);
     applySettings();
+    restoreChatHistory();   // ★ 新增：恢复聊天记录（必须在 scrollToBottom 之前）
     scrollToBottom();
     updateFullscreenUI();
 
@@ -1129,7 +1221,17 @@ function init() {
     if ($('opponentAvatarInput')) $('opponentAvatarInput').onchange = function(e) { var f = e.target.files[0]; if (!f) return; var r = new FileReader(); r.onload = function(ev) { appSettings.opponentAvatar = ev.target.result; saveAppSettings(); applySettings(); }; r.readAsDataURL(f); e.target.value = ''; };
     if ($('userAvatarInput')) $('userAvatarInput').onchange = function(e) { var f = e.target.files[0]; if (!f) return; var r = new FileReader(); r.onload = function(ev) { appSettings.userAvatar = ev.target.result; saveAppSettings(); applySettings(); }; r.readAsDataURL(f); e.target.value = ''; };
 
-    if ($('clearChatHistoryBtn')) $('clearChatHistoryBtn').onclick = function() { showConfirm('清空聊天记录', '是否清空？', function() { if ($('chatContainer')) $('chatContainer').innerHTML = ''; lastMessageDateStr = ''; userMessageHistory = []; replyQueue = []; isProcessingQueue = false; lastSender = ''; showAlert('提示', '已清空'); }, true); };
+    /* ★ 改动：清空聊天记录时同步清空存档 */
+    if ($('clearChatHistoryBtn')) $('clearChatHistoryBtn').onclick = function() {
+        showConfirm('清空聊天记录', '是否清空？', function() {
+            if ($('chatContainer')) $('chatContainer').innerHTML = '';
+            lastMessageDateStr = ''; userMessageHistory = [];
+            replyQueue = []; isProcessingQueue = false; lastSender = '';
+            chatHistory = [];
+            try { localStorage.removeItem(CHAT_HISTORY_KEY); } catch (e) {}
+            showAlert('提示', '已清空');
+        }, true);
+    };
     if ($('resetAllDataBtn')) $('resetAllDataBtn').onclick = function() { showConfirm('恢复出厂设置', '⚠️ 将清空所有数据，确定吗？', function() { safeClear(); location.reload(); }, true); };
 
     if ($('userInput')) $('userInput').onkeypress = function(e) { if (e.key === 'Enter' || e.keyCode === 13) sendMessage(); };
@@ -1159,6 +1261,8 @@ function init() {
                 var picked = valid[idx];
                 var optEls = card.querySelectorAll('.choice-card-option');
                 if (optEls[idx]) optEls[idx].className = 'choice-card-option picked';
+                /* ★ 改动：同步更新存档中的选中项 */
+                if (card._histRec) { card._histRec.picked = idx; saveChatHistory(); }
                 appendMessage(picked, 'received');
             }, delay);
         }, 300);
